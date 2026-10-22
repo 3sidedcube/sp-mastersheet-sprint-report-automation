@@ -44,11 +44,35 @@ PROJECT_TAB = "Tickets By Project"
 # Logical column order produced by build_project_table(); these are matched to
 # the sheet's row-1 headers at write time so a spacer/divider column between
 # Security and the status columns (or any header reorder) won't misalign data.
-PROJECT_COLUMNS = ["Project", "Tickets", "Security", "To Do", "In Progress", "Awaiting PR", "Delivered"]
+PROJECT_COLUMNS = ["Project", "Tickets", "Security", "To Do", "In Progress", "PR Review", "AI Review", "Delivered"]
 
 # Component name -> dashboard label
 COMP_MAP = {"iOS": "iOS", "Android": "Android", "React Native": "RN", "BED": "BED", "FED": "FED"}
+
+# --- Board status -> report bucket mapping -------------------------------------
+# Each board column maps to one or more Jira statuses. Statuses NOT listed in any
+# group below (e.g. "Accepted", "Rejected") are treated as done/terminal and are
+# excluded from every count, exactly like the board treats them.
+#
+#   Needs Testing  <- status "Delivered"            (single status, see fetch_all)
+#   PR Review      <- status "Finished"             (single status, see fetch_all)
+#   In Progress    <- IN_PROG_STATUSES below
+#   To Do          <- TODO_STATUSES below
+#   AI Review      <- SCOUT_REVIEW_STATUSES below  (** see TODO **)
 IN_PROG_STATUSES = {"In Progress", "Awaiting Response"}
+TODO_STATUSES = {"Open", "To Do"}
+
+# The board's "Scout Review" column is driven by the Jira status "AI Review"
+# (confirmed from the board's status-to-column mapping). It feeds the sheet's
+# "AI Review" row / column. Other unmapped statuses on the board — "AI Built",
+# "Awaiting Response" (folded into In Progress below instead), "Backlog",
+# "Rejected", "Accepted" — are intentionally excluded from all counts.
+SCOUT_REVIEW_STATUSES = {"AI Review"}
+
+
+def _jql_status_list(statuses):
+    """Format a set of status names into a JQL IN-list, e.g. '"Open","To Do"'."""
+    return ", ".join(f'"{s}"' for s in sorted(statuses))
 
 # Emoji / marker prefixes stripped from summaries
 EMOJI_PREFIXES = ["🤝 ", "🛑 ", "🤝", "🛑", "🏎 🔄 ", "❓ ", "🔄 ", "🎓 ", "🎨 "]
@@ -110,9 +134,17 @@ def fetch_all():
     base = f'project = {PROJECT_KEY} AND sprint in openSprints() AND'
     delivered = slim(jira_search(f'{base} status = "Delivered" ORDER BY created ASC'), "Delivered")
     finished = slim(jira_search(f'{base} status = "Finished" ORDER BY created ASC'), "Finished")
-    in_prog = slim(jira_search(f'{base} status in ("In Progress","Awaiting Response") ORDER BY status ASC'))
-    open_i = slim(jira_search(f'{base} status = "Open" ORDER BY created ASC'), "Open")
-    return delivered, finished, in_prog, open_i
+    in_prog = slim(jira_search(
+        f'{base} status in ({_jql_status_list(IN_PROG_STATUSES)}) ORDER BY status ASC'))
+    todo = slim(jira_search(
+        f'{base} status in ({_jql_status_list(TODO_STATUSES)}) ORDER BY created ASC'))
+    # AI Review / Scout Review: only query when the status name has been set.
+    scout = []
+    if SCOUT_REVIEW_STATUSES:
+        scout = slim(jira_search(
+            f'{base} status in ({_jql_status_list(SCOUT_REVIEW_STATUSES)}) ORDER BY created ASC'))
+    # Accepted / Rejected (and any other status) are intentionally not fetched.
+    return delivered, finished, scout, in_prog, todo
 
 
 # ----------------------------------------------------------------------------
@@ -126,7 +158,7 @@ def is_sec(components):
     return "Security" in components
 
 
-def build_status_column(delivered, finished, in_prog, open_i):
+def build_status_column(delivered, finished, scout, in_prog, todo):
     """Returns an ordered list of (row_label, value) for one weekly column.
 
     Values are matched to sheet rows by their column-A label at write time, so
@@ -138,10 +170,13 @@ def build_status_column(delivered, finished, in_prog, open_i):
     Matching is case-insensitive and whitespace-normalised, and a metric label
     is allowed to be a prefix of the sheet label (so the sheet may read
     "Missing Component - Needs Attention" while the metric is "Missing Component").
+
+    The component "Pending" breakdown is computed from the To Do bucket (which
+    now covers both the 'Open' and 'To Do' Jira statuses).
     """
     comp = {"iOS": 0, "Android": 0, "RN": 0, "BED": 0, "FED": 0}
     missing_component = 0
-    for i in open_i:
+    for i in todo:
         tech = get_tech(i["components"])
         if tech:
             for c in tech:
@@ -150,13 +185,15 @@ def build_status_column(delivered, finished, in_prog, open_i):
             missing_component += 1
 
     needs_testing = len(delivered)
-    awaiting_pr = len(finished)
+    pr_review = len(finished)
+    ai_review = len(scout)
     in_progress = len(in_prog)
-    jira_total = needs_testing + awaiting_pr + in_progress + len(open_i)
+    jira_total = needs_testing + pr_review + ai_review + in_progress + len(todo)
 
     return [
         ("Needs Testing", needs_testing),
-        ("Awaiting PR", awaiting_pr),
+        ("PR Review", pr_review),
+        ("AI Review", ai_review),
         ("In Progress", in_progress),
         ("iOS Pending", comp["iOS"]),
         ("Android Pending", comp["Android"]),
@@ -180,15 +217,18 @@ def project_display_name(parent_summary):
     return name or parent_summary
 
 
-def build_project_table(delivered, finished, in_prog, open_i):
+def build_project_table(delivered, finished, scout, in_prog, todo):
     """Returns rows for 'Tickets By Project', sorted by total desc, plus a Total row.
 
     Every ticket is counted exactly once. Tickets with no parent epic are kept
     under an explicit 'Missing parent' row rather than dropped, so the grand
     total always reconciles with the JIRA Total on the status tab.
+
+    Per-project status columns: To Do | In Progress | PR Review | AI Review |
+    Delivered (full counts including security).
     """
     MISSING_PARENT = "__none__"
-    all_issues = delivered + finished + in_prog + open_i
+    all_issues = delivered + finished + scout + in_prog + todo
     projects = {}
     for i in all_issues:
         pk = i["parent_key"] or MISSING_PARENT
@@ -197,7 +237,7 @@ def build_project_table(delivered, finished, in_prog, open_i):
             projects[pk] = {
                 "key": pk,
                 "name": name,
-                "nt": 0, "pr": 0, "ip": 0, "td": 0, "sec": 0,
+                "nt": 0, "pr": 0, "ai": 0, "ip": 0, "td": 0, "sec": 0,
             }
         p = projects[pk]
         s = i["status"]
@@ -205,12 +245,17 @@ def build_project_table(delivered, finished, in_prog, open_i):
             p["nt"] += 1
         elif s == "Finished":
             p["pr"] += 1
+        elif s in SCOUT_REVIEW_STATUSES:
+            p["ai"] += 1
         elif s in IN_PROG_STATUSES:
             p["ip"] += 1
-        elif s == "Open":
+        elif s in TODO_STATUSES:
             p["td"] += 1
         if is_sec(i["components"]):
             p["sec"] += 1
+
+    def proj_total(p):
+        return p["nt"] + p["pr"] + p["ai"] + p["ip"] + p["td"]
 
     rows = []
     grand_total = 0    # full total incl. security (must equal JIRA Total)
@@ -219,10 +264,10 @@ def build_project_table(delivered, finished, in_prog, open_i):
     # reads as an exceptions row rather than a project.
     ordered = sorted(
         projects.values(),
-        key=lambda p: (p["key"] == MISSING_PARENT, -(p["nt"] + p["pr"] + p["ip"] + p["td"])),
+        key=lambda p: (p["key"] == MISSING_PARENT, -proj_total(p)),
     )
     for p in ordered:
-        total = p["nt"] + p["pr"] + p["ip"] + p["td"]
+        total = proj_total(p)
         if total == 0:
             continue
         grand_total += total
@@ -230,9 +275,10 @@ def build_project_table(delivered, finished, in_prog, open_i):
         # 'Tickets' excludes security tickets so they aren't double-counted
         # (they're shown only in the Security column). Status breakdown columns
         # keep their FULL counts including security, matching the source sheet:
-        # per project, Tickets + Security == To Do + In Progress + Awaiting PR + Delivered.
+        # per project, Tickets + Security == To Do + In Progress + PR Review +
+        # AI Review + Delivered.
         non_sec = total - p["sec"]
-        # Columns: Project | Tickets | Security | To Do | In Progress | Awaiting PR | Delivered
+        # Columns: Project | Tickets | Security | To Do | In Progress | PR Review | AI Review | Delivered
         rows.append([
             p["name"],
             non_sec if non_sec > 0 else "-",
@@ -240,6 +286,7 @@ def build_project_table(delivered, finished, in_prog, open_i):
             p["td"] if p["td"] > 0 else "-",
             p["ip"] if p["ip"] > 0 else "-",
             p["pr"] if p["pr"] > 0 else "-",
+            p["ai"] if p["ai"] > 0 else "-",
             p["nt"] if p["nt"] > 0 else "-",
         ])
 
@@ -247,7 +294,7 @@ def build_project_table(delivered, finished, in_prog, open_i):
     # total = JIRA Total) shown in one merged cell spanning the Tickets and
     # Security columns. We put the combined total in the Tickets cell and leave
     # Security blank; overwrite_project_table merges the two cells after writing.
-    total_row = ["Total", grand_total, "", "", "", "", ""]
+    total_row = ["Total", grand_total, "", "", "", "", "", ""]
     return rows, total_row
 
 
@@ -555,14 +602,15 @@ def thursday_label(today=None):
 
 def main():
     print("Fetching Jira buckets...", flush=True)
-    delivered, finished, in_prog, open_i = fetch_all()
-    print(f"  Delivered:   {len(delivered)}")
-    print(f"  Finished:    {len(finished)}")
-    print(f"  In Progress: {len(in_prog)}")
-    print(f"  Open:        {len(open_i)}")
+    delivered, finished, scout, in_prog, todo = fetch_all()
+    print(f"  Delivered (Needs Testing): {len(delivered)}")
+    print(f"  Finished (PR Review):      {len(finished)}")
+    print(f"  AI Review:                 {len(scout)}")
+    print(f"  In Progress:               {len(in_prog)}")
+    print(f"  To Do (Open + To Do):      {len(todo)}")
 
-    status_metrics = build_status_column(delivered, finished, in_prog, open_i)
-    proj_rows, total_row = build_project_table(delivered, finished, in_prog, open_i)
+    status_metrics = build_status_column(delivered, finished, scout, in_prog, todo)
+    proj_rows, total_row = build_project_table(delivered, finished, scout, in_prog, todo)
     status_map = dict(status_metrics)
     jira_total = status_map["JIRA Total"]
     # total_row is ["Total", combined_grand_total, "", ...]; the combined figure
