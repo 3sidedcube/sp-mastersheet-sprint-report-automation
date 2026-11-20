@@ -13,9 +13,11 @@ concurrency:
   group: sprint-report
   cancel-in-progress: false
 
-# Needed so the keepalive step can push a commit back to the repo.
+# The keepalive re-enables this workflow via the API (actions: write). No
+# contents write is needed any more — we no longer push a commit to main.
 permissions:
-  contents: write
+  contents: read
+  actions: write
 
 jobs:
   refresh:
@@ -61,33 +63,20 @@ jobs:
 
       # ---------------------------------------------------------------------
       # Keepalive. GitHub disables a scheduled workflow after 60 days with NO
-      # repo commit activity. This step writes a timestamp file and commits it
-      # each run (weekly, well inside 60 days) so the schedule never lapses.
+      # repository activity. We keep it alive by calling the API to re-enable
+      # this workflow on every run — this does NOT push a commit, so it is
+      # unaffected by branch-protection rules on main (which require PRs and
+      # would reject a direct push).
       #
-      # CAVEAT (read HANDOVER.md): a commit authored by the default GITHUB_TOKEN
-      # does NOT always reset the 60-day idle timer. As a belt-and-braces backup,
-      # the next step also calls the API to explicitly re-enable this workflow,
-      # which is the reliable guarantee. Keep both.
+      # We deliberately do NOT use the older "timestamp commit" approach: a push
+      # to main is now blocked by the repo's pull-request rule, and a commit by
+      # the built-in GITHUB_TOKEN never reliably reset the 60-day timer anyway.
+      # The API re-enable below is the dependable mechanism.
       #
       # A keepalive only protects an otherwise-healthy job. If the real run above
       # has been failing for weeks (e.g. broken credentials) and nobody fixes it,
       # the workflow can still end up disabled — see HANDOVER.md troubleshooting.
       # ---------------------------------------------------------------------
-      - name: Keepalive — timestamp commit
-        if: always()
-        run: |
-          mkdir -p .keepalive
-          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive/last-run.txt
-          git config user.name "sprint-report-bot"
-          git config user.email "actions@github.com"
-          git add .keepalive/last-run.txt
-          if git diff --staged --quiet; then
-            echo "No keepalive change to commit."
-          else
-            git commit -m "chore: keepalive timestamp [skip ci]"
-            git push
-          fi
-
       - name: Keepalive — ensure workflow stays enabled
         if: always()
         env:
